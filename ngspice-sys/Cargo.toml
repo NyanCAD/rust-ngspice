@@ -1,0 +1,16 @@
+[package]
+name = "ngspice-sys"
+description = "A bindgen crate for ngspice"
+version = "0.1.0"
+authors = ["Pepijn de Vos <pepijndevos@gmail.com>"]
+edition = "2018"
+license = "Apache-2.0"
+repository = "https://github.com/pepijndevos/rust-ngspice"
+readme = "../README.md"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+
+[build-dependencies]
+bindgen = "0.55.1"
