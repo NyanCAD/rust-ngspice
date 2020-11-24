@@ -6,6 +6,8 @@ use std::sync::Once;
 #[derive(Debug)]
 pub enum NgSpiceError {
     DoubleInitError,
+    CommandError,
+    EncodingError,
 }
 
 static START: Once = Once::new();
@@ -74,10 +76,10 @@ unsafe extern "C" fn controlled_exit<C: Callbacks>(
 impl<C: Callbacks> NgSpice<C> {
     pub fn new(c: C) -> Result<Box<NgSpice<C>>, NgSpiceError> {
         let spice = NgSpice {
-                    callbacks: c,
-                    exited: false,
-                    initiated: false,
-                };
+            callbacks: c,
+            exited: false,
+            initiated: false,
+        };
         let ptr = Box::new(spice);
         let rawptr = Box::into_raw(ptr);
         START.call_once(|| unsafe {
@@ -100,10 +102,9 @@ impl<C: Callbacks> NgSpice<C> {
                 return Err(NgSpiceError::DoubleInitError);
             }
         }
-
     }
 
-    pub fn command(&self, s: &str) {
+    pub fn command(&self, s: &str) -> Result<(), NgSpiceError> {
         if self.exited {
             panic!("NgSpice exited")
         }
@@ -112,9 +113,40 @@ impl<C: Callbacks> NgSpice<C> {
             let raw = cs.into_raw();
             unsafe {
                 let ret = ngSpice_Command(raw);
-                println!("{}", ret);
                 let _cs = CString::from_raw(raw);
+                if ret == 0 {
+                    Ok(())
+                } else {
+                    Err(NgSpiceError::CommandError)
+                }
             }
+        } else {
+            Err(NgSpiceError::EncodingError)
+        }
+    }
+
+    pub fn circuit(&self, circ: &[&str]) -> Result<(), NgSpiceError> {
+        let buf_res: Result<Vec<*mut i8>, _> = circ
+            .iter()
+            .map(|s| CString::new(*s).map(|cs| cs.into_raw()))
+            .collect();
+        if let Ok(mut buf) = buf_res {
+            buf.push(std::ptr::null_mut());
+            unsafe {
+                let res = ngSpice_Circ(buf.as_mut_ptr());
+                for b in buf {
+                    if !b.is_null() {
+                        CString::from_raw(b); // drop strings
+                    }
+                }
+                if res == 1 {
+                    Err(NgSpiceError::CommandError)
+                } else {
+                    Ok(())
+                }
+            }
+        } else {
+            Err(NgSpiceError::EncodingError)
         }
     }
 }
@@ -143,13 +175,25 @@ mod tests {
         let c = Cb { strs: Vec::new() };
         let spice = NgSpice::new(c).unwrap();
         assert!(NgSpice::new(Cb { strs: Vec::new() }).is_err());
-        spice.command("echo hello");
+        spice.command("echo hello").expect("echo failed");
         assert_eq!(
             spice.callbacks.strs.last().unwrap_or(&String::new()),
             "stdout hello"
         );
-        spice.command("exit");
-        let result = std::panic::catch_unwind(|| spice.command("echo hello"));
-        assert!(result.is_err());
+        //spice.command("source simple.cir").expect("source failed");
+        spice.circuit(&[
+                ".title KiCad schematic",
+                "R1 /vcc GND 50",
+                "V1 /vcc GND dc(1)",
+                ".op",
+                ".end",
+            ])
+            .expect("circuit failed");
+        //spice.command("op").expect("op failed");
+        spice.command("setcirc").expect("run failed");
+        spice.command("run").expect("run failed");
+        //spice.command("quit").expect("quit failed");
+        //let result = std::panic::catch_unwind(|| spice.command("echo hello"));
+        //assert!(result.is_err());
     }
 }
