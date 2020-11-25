@@ -2,6 +2,7 @@ use ngspice_sys::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Once;
+use std::convert::TryInto;
 
 #[derive(Debug)]
 pub enum NgSpiceError {
@@ -16,6 +17,12 @@ pub struct NgSpice<C> {
     pub callbacks: C,
     exited: bool,
     initiated: bool,
+}
+
+#[derive(Debug)]
+pub struct VectorInfo {
+    pub name: String,
+    pub data: Vec<f64>,
 }
 
 extern "C" fn dummy_controlled_exit(
@@ -113,7 +120,7 @@ impl<C: Callbacks> NgSpice<C> {
             let raw = cs.into_raw();
             unsafe {
                 let ret = ngSpice_Command(raw);
-                let _cs = CString::from_raw(raw);
+                CString::from_raw(raw);
                 if ret == 0 {
                     Ok(())
                 } else {
@@ -145,6 +152,94 @@ impl<C: Callbacks> NgSpice<C> {
                     Err(NgSpiceError::CommandError)
                 } else {
                     Ok(())
+                }
+            }
+        } else {
+            Err(NgSpiceError::EncodingError)
+        }
+    }
+
+    pub fn current_plot(&self) -> Result<String, NgSpiceError> {
+        unsafe {
+            let ret = ngSpice_CurPlot();
+            let ptr_res = CStr::from_ptr(ret).to_str();
+            if let Ok(ptr) = ptr_res {
+                Ok(String::from(ptr))
+            } else {
+                return Err(NgSpiceError::EncodingError);
+            }
+        }
+    }
+
+    pub fn all_plots(&self) -> Result<Vec<String>, NgSpiceError> {
+        unsafe {
+            let ptrs = ngSpice_AllPlots();
+            let mut strs: Vec<String> = Vec::new();
+            let mut i = 0;
+            while !(*ptrs.offset(i)).is_null() {
+                let ptr_res = CStr::from_ptr(*ptrs.offset(i)).to_str();
+                if let Ok(ptr) = ptr_res {
+                    let s = String::from(ptr);
+                    strs.push(s);
+                } else {
+                    return Err(NgSpiceError::EncodingError);
+                }
+                i+=1;
+            }
+            return Ok(strs);
+        }
+    }
+
+    pub fn all_vecs(&self, plot: &str) -> Result<Vec<String>, NgSpiceError> {
+        let cs_res = CString::new(plot);
+        if let Ok(cs) = cs_res {
+            let raw = cs.into_raw();
+            unsafe {
+                let ptrs = ngSpice_AllVecs(raw);
+                CString::from_raw(raw);
+                let mut strs: Vec<String> = Vec::new();
+                let mut i = 0;
+                while !(*ptrs.offset(i)).is_null() {
+                    let ptr_res = CStr::from_ptr(*ptrs.offset(i)).to_str();
+                    if let Ok(ptr) = ptr_res {
+                        let s = String::from(ptr);
+                        strs.push(s);
+                    } else {
+                        return Err(NgSpiceError::EncodingError);
+                    }
+                    i+=1;
+                }
+                Ok(strs)
+            }
+        } else {
+            Err(NgSpiceError::EncodingError)
+        }
+    }
+
+    pub fn vector_info(&self, vec: &str) -> Result<VectorInfo, NgSpiceError> {
+        let cs_res = CString::new(vec);
+        if let Ok(cs) = cs_res {
+            let raw = cs.into_raw();
+            unsafe {
+                let vecinfo = *ngGet_Vec_Info(raw);
+                CString::from_raw(raw);
+                if vecinfo.v_realdata.is_null() {
+                    return Err(NgSpiceError::CommandError);
+                }
+                let ptr_res = CStr::from_ptr(vecinfo.v_name).to_str();
+                let len_res: Result<usize, _> = vecinfo.v_length.try_into();
+                match (ptr_res, len_res) {
+                    (Ok(ptr), Ok(len)) => {
+                        let s = String::from(ptr);
+                        let real_slice = std::slice::from_raw_parts_mut(vecinfo.v_realdata, len);
+                        return Ok(VectorInfo {
+                            name: s,
+                            data: Vec::from(real_slice),
+                        })
+                    }
+                    _ => {
+                        return Err(NgSpiceError::EncodingError);
+                    }
                 }
             }
         } else {
@@ -184,13 +279,30 @@ mod tests {
         );
         spice.circuit(&[
                 ".title KiCad schematic",
-                "R1 /vcc GND 50",
-                "V1 /vcc GND dc(1)",
+                ".MODEL FAKE_NMOS NMOS (LEVEL=3 VTO=0.75)",
+                ".save all @m1[gm] @m1[id]",
+                "M1 /drain /gate GND GND FAKE_NMOS W=10u L=1u",
+                "V1 /drain GND dc(5)",
+                "V2 /gate GND dc(2)",
                 ".end",
             ])
             .expect("circuit failed");
         spice.command("op").expect("op failed");
-        spice.command("run").expect("run failed");
+        spice.command("alter m1 W=20u").expect("op failed");
+        spice.command("op").expect("op failed");
+        let plots = spice.all_plots().expect("plots failed");
+        println!("{:?}", plots);
+        assert_eq!(plots[0], "op2");
+        let curplot = spice.current_plot().expect("curplot failed");
+        assert_eq!(curplot, "op2");
+        for plot in plots {
+            let vecs = spice.all_vecs(&plot).expect("vecs");
+            println!("{}: {:?}", plot, vecs);
+            for vec in vecs {
+                let vecinfo = spice.vector_info(&format!("{}.{}", plot, vec));
+                println!("{:?}", vecinfo);
+            }
+        }
         //spice.command("quit").expect("quit failed");
         //let result = std::panic::catch_unwind(|| spice.command("echo hello"));
         //assert!(result.is_err());
