@@ -1,57 +1,27 @@
 use ngspice_sys::*;
 use std::ffi::{CStr, CString, NulError};
 use std::os::raw::{c_char, c_int, c_void};
-use std::sync::Once;
+use libloading::library_filename;
 use std::convert::TryInto;
 
 #[derive(Debug)]
 pub enum NgSpiceError {
-    DoubleInitError,
+    InitError,
     CommandError,
     EncodingError,
 }
 
-static START: Once = Once::new();
-
-#[derive(Debug)]
+// #[derive(Debug)]
 pub struct NgSpice<C> {
+    ngspice: ngspice,
     pub callbacks: C,
     exited: bool,
-    initiated: bool,
 }
 
 #[derive(Debug)]
 pub struct VectorInfo {
     pub name: String,
     pub data: Vec<f64>,
-}
-
-extern "C" fn dummy_controlled_exit(
-    _arg1: c_int,
-    _arg2: bool,
-    _arg3: bool,
-    _arg4: c_int,
-    _arg5: *mut c_void,
-) -> c_int {
-    0
-}
-
-impl<C> Drop for NgSpice<C> {
-    fn drop(&mut self) {
-        if self.initiated && !self.exited {
-            unsafe {
-                ngSpice_Init(
-                    None,
-                    None,
-                    Some(dummy_controlled_exit),
-                    None,
-                    None,
-                    None,
-                    std::ptr::null_mut(),
-                );
-            }
-        }
-    }
 }
 
 unsafe extern "C" fn send_char<C: Callbacks>(
@@ -99,17 +69,23 @@ impl From<std::num::TryFromIntError> for NgSpiceError {
     }
 }
 
+impl From<libloading::Error> for NgSpiceError {
+    fn from(_e: libloading::Error) -> NgSpiceError {
+        NgSpiceError::InitError
+    }
+}
+
 impl<C: Callbacks> NgSpice<C> {
     pub fn new(c: C) -> Result<std::sync::Arc<NgSpice<C>>, NgSpiceError> {
-        let spice = NgSpice {
-            callbacks: c,
-            exited: false,
-            initiated: false,
-        };
-        let mut ptr = std::sync::Arc::new(spice);
-        let rawptr = std::sync::Arc::as_ptr(&ptr);
-        START.call_once(|| unsafe {
-            ngSpice_Init(
+        unsafe{
+            let spice = NgSpice {
+                ngspice: ngspice::new(library_filename("ngspice"))?,
+                callbacks: c,
+                exited: false,
+            };
+            let ptr = std::sync::Arc::new(spice);
+            let rawptr = std::sync::Arc::as_ptr(&ptr);
+            ptr.ngspice.ngSpice_Init(
                 Some(send_char::<C>),
                 None,
                 Some(controlled_exit::<C>),
@@ -118,12 +94,7 @@ impl<C: Callbacks> NgSpice<C> {
                 None,
                 rawptr as _,
             );
-            std::sync::Arc::get_mut(&mut ptr).unwrap().initiated = true;
-        });
-        if ptr.initiated {
             return Ok(ptr);
-        } else {
-            return Err(NgSpiceError::DoubleInitError);
         }
     }
 
@@ -135,7 +106,7 @@ impl<C: Callbacks> NgSpice<C> {
         if let Ok(cs) = cs_res {
             let raw = cs.into_raw();
             unsafe {
-                let ret = ngSpice_Command(raw);
+                let ret = self.ngspice.ngSpice_Command(raw);
                 CString::from_raw(raw);
                 if ret == 0 {
                     Ok(())
@@ -158,7 +129,7 @@ impl<C: Callbacks> NgSpice<C> {
             buf.push(CString::new("").unwrap().into_raw());
             buf.push(std::ptr::null_mut());
             unsafe {
-                let res = ngSpice_Circ(buf.as_mut_ptr());
+                let res = self.ngspice.ngSpice_Circ(buf.as_mut_ptr());
                 for b in buf {
                     if !b.is_null() {
                         CString::from_raw(b); // drop strings
@@ -177,7 +148,7 @@ impl<C: Callbacks> NgSpice<C> {
 
     pub fn current_plot(&self) -> Result<String, NgSpiceError> {
         unsafe {
-            let ret = ngSpice_CurPlot();
+            let ret = self.ngspice.ngSpice_CurPlot();
             let ptr_res = CStr::from_ptr(ret).to_str();
             if let Ok(ptr) = ptr_res {
                 Ok(String::from(ptr))
@@ -189,7 +160,7 @@ impl<C: Callbacks> NgSpice<C> {
 
     pub fn all_plots(&self) -> Result<Vec<String>, NgSpiceError> {
         unsafe {
-            let ptrs = ngSpice_AllPlots();
+            let ptrs = self.ngspice.ngSpice_AllPlots();
             let mut strs: Vec<String> = Vec::new();
             let mut i = 0;
             while !(*ptrs.offset(i)).is_null() {
@@ -211,7 +182,7 @@ impl<C: Callbacks> NgSpice<C> {
         if let Ok(cs) = cs_res {
             let raw = cs.into_raw();
             unsafe {
-                let ptrs = ngSpice_AllVecs(raw);
+                let ptrs = self.ngspice.ngSpice_AllVecs(raw);
                 CString::from_raw(raw);
                 let mut strs: Vec<String> = Vec::new();
                 let mut i = 0;
@@ -236,7 +207,7 @@ impl<C: Callbacks> NgSpice<C> {
         let cs = CString::new(vec)?;
         let raw = cs.into_raw();
         unsafe {
-            let vecinfo = *ngGet_Vec_Info(raw);
+            let vecinfo = *self.ngspice.ngGet_Vec_Info(raw);
             CString::from_raw(raw);
             let ptr = CStr::from_ptr(vecinfo.v_name).to_str()?;
             let len = vecinfo.v_length.try_into()?;
@@ -280,7 +251,7 @@ mod tests {
     fn it_works() {
         let c = Cb { strs: Vec::new() };
         let spice = NgSpice::new(c).unwrap();
-        assert!(NgSpice::new(Cb { strs: Vec::new() }).is_err());
+        // assert!(NgSpice::new(Cb { strs: Vec::new() }).is_err());
         spice.command("echo hello").expect("echo failed");
         assert_eq!(
             spice.callbacks.strs.last().unwrap_or(&String::new()),
