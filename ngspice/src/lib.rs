@@ -1,5 +1,5 @@
 use ngspice_sys::*;
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, NulError};
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::Once;
 use std::convert::TryInto;
@@ -13,6 +13,7 @@ pub enum NgSpiceError {
 
 static START: Once = Once::new();
 
+#[derive(Debug)]
 pub struct NgSpice<C> {
     pub callbacks: C,
     exited: bool,
@@ -80,15 +81,33 @@ unsafe extern "C" fn controlled_exit<C: Callbacks>(
     0
 }
 
+impl From<NulError> for NgSpiceError {
+    fn from(_e: NulError) -> NgSpiceError {
+        NgSpiceError::EncodingError
+    }
+}
+
+impl From<std::str::Utf8Error> for NgSpiceError {
+    fn from(_e: std::str::Utf8Error) -> NgSpiceError {
+        NgSpiceError::EncodingError
+    }
+}
+
+impl From<std::num::TryFromIntError> for NgSpiceError {
+    fn from(_e: std::num::TryFromIntError) -> NgSpiceError {
+        NgSpiceError::EncodingError
+    }
+}
+
 impl<C: Callbacks> NgSpice<C> {
-    pub fn new(c: C) -> Result<Box<NgSpice<C>>, NgSpiceError> {
+    pub fn new(c: C) -> Result<std::sync::Arc<NgSpice<C>>, NgSpiceError> {
         let spice = NgSpice {
             callbacks: c,
             exited: false,
             initiated: false,
         };
-        let ptr = Box::new(spice);
-        let rawptr = Box::into_raw(ptr);
+        let mut ptr = std::sync::Arc::new(spice);
+        let rawptr = std::sync::Arc::as_ptr(&ptr);
         START.call_once(|| unsafe {
             ngSpice_Init(
                 Some(send_char::<C>),
@@ -99,15 +118,12 @@ impl<C: Callbacks> NgSpice<C> {
                 None,
                 rawptr as _,
             );
-            (*rawptr).initiated = true;
+            std::sync::Arc::get_mut(&mut ptr).unwrap().initiated = true;
         });
-        unsafe {
-            let ptr = Box::from_raw(rawptr);
-            if ptr.initiated {
-                return Ok(ptr);
-            } else {
-                return Err(NgSpiceError::DoubleInitError);
-            }
+        if ptr.initiated {
+            return Ok(ptr);
+        } else {
+            return Err(NgSpiceError::DoubleInitError);
         }
     }
 
@@ -217,33 +233,26 @@ impl<C: Callbacks> NgSpice<C> {
     }
 
     pub fn vector_info(&self, vec: &str) -> Result<VectorInfo, NgSpiceError> {
-        let cs_res = CString::new(vec);
-        if let Ok(cs) = cs_res {
-            let raw = cs.into_raw();
-            unsafe {
-                let vecinfo = *ngGet_Vec_Info(raw);
-                CString::from_raw(raw);
-                if vecinfo.v_realdata.is_null() {
-                    return Err(NgSpiceError::CommandError);
-                }
-                let ptr_res = CStr::from_ptr(vecinfo.v_name).to_str();
-                let len_res: Result<usize, _> = vecinfo.v_length.try_into();
-                match (ptr_res, len_res) {
-                    (Ok(ptr), Ok(len)) => {
-                        let s = String::from(ptr);
-                        let real_slice = std::slice::from_raw_parts_mut(vecinfo.v_realdata, len);
-                        return Ok(VectorInfo {
-                            name: s,
-                            data: Vec::from(real_slice),
-                        })
-                    }
-                    _ => {
-                        return Err(NgSpiceError::EncodingError);
-                    }
-                }
+        let cs = CString::new(vec)?;
+        let raw = cs.into_raw();
+        unsafe {
+            let vecinfo = *ngGet_Vec_Info(raw);
+            CString::from_raw(raw);
+            let ptr = CStr::from_ptr(vecinfo.v_name).to_str()?;
+            let len = vecinfo.v_length.try_into()?;
+            let s = String::from(ptr);
+            if !vecinfo.v_realdata.is_null() {
+                let real_slice = std::slice::from_raw_parts_mut(vecinfo.v_realdata, len);
+                return Ok(VectorInfo {
+                    name: s,
+                    data: Vec::from(real_slice),
+                })
+            } else { // todo complex data
+                return Ok(VectorInfo {
+                    name: s,
+                    data: Vec::new(),
+                })
             }
-        } else {
-            Err(NgSpiceError::EncodingError)
         }
     }
 }
@@ -280,9 +289,10 @@ mod tests {
         spice.circuit(&[
                 ".title KiCad schematic",
                 ".MODEL FAKE_NMOS NMOS (LEVEL=3 VTO=0.75)",
-                ".save all @m1[gm] @m1[id]",
+                ".save all @m1[gm] @m1[id] @m1[vgs] @m1[vds] @m1[vto]",
+                "R1 /vdd /drain 10k",
                 "M1 /drain /gate GND GND FAKE_NMOS W=10u L=1u",
-                "V1 /drain GND dc(5)",
+                "V1 /vdd GND dc(5)",
                 "V2 /gate GND dc(2)",
                 ".end",
             ])
