@@ -20,6 +20,8 @@ fn main() {
         .header("wrapper.h")
         // Load at runtime
         .dynamic_library_name("ngspice")
+        // make Rust enum
+        .default_enum_style(bindgen::EnumVariation::Rust{non_exhaustive:false})
         // Tell cargo to invalidate the built crate whenever any of the
         // included header files changed.
         .parse_callbacks(Box::new(bindgen::CargoCallbacks))
