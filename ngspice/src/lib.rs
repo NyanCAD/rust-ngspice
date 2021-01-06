@@ -3,6 +3,7 @@ use std::ffi::{CStr, CString, NulError};
 use std::os::raw::{c_char, c_int, c_void};
 use libloading::library_filename;
 use std::convert::TryInto;
+use std::collections::HashMap;
 
 #[derive(Debug)]
 pub enum NgSpiceError {
@@ -19,9 +20,29 @@ pub struct NgSpice<C> {
 }
 
 #[derive(Debug)]
-pub struct VectorInfo {
+pub enum ComplexSlice<'a> {
+    Real(&'a [f64]),
+    Complex(&'a [ngcomplex])
+}
+
+#[derive(Debug)]
+pub struct VectorInfo<'a> {
     pub name: String,
-    pub data: Vec<f64>,
+    pub dtype: simulation_types,
+    pub data: ComplexSlice<'a>,
+}
+
+pub struct SimulationResult<'a, C: Callbacks> {
+    pub name: String,
+    pub data: HashMap<String, VectorInfo<'a>>,
+    sim: &'a NgSpice<C>,
+}
+
+impl <'a, C: Callbacks> Drop for SimulationResult<'a, C> {
+    fn drop(&mut self) {
+        let cmd = format!("destroy {}", self.name.as_str());
+        self.sim.command(cmd.as_str()).expect("Failed to free simulation");
+    }
 }
 
 unsafe extern "C" fn send_char<C: Callbacks>(
@@ -98,7 +119,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    pub fn command(&self, s: &str) -> Result<(), NgSpiceError> {
+    fn command(&self, s: &str) -> Result<(), NgSpiceError> {
         if self.exited {
             panic!("NgSpice exited")
         }
@@ -146,7 +167,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    pub fn current_plot(&self) -> Result<String, NgSpiceError> {
+    fn current_plot(&self) -> Result<String, NgSpiceError> {
         unsafe {
             let ret = self.ngspice.ngSpice_CurPlot();
             let ptr_res = CStr::from_ptr(ret).to_str();
@@ -158,7 +179,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    pub fn all_plots(&self) -> Result<Vec<String>, NgSpiceError> {
+    fn all_plots(&self) -> Result<Vec<String>, NgSpiceError> {
         unsafe {
             let ptrs = self.ngspice.ngSpice_AllPlots();
             let mut strs: Vec<String> = Vec::new();
@@ -177,7 +198,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    pub fn all_vecs(&self, plot: &str) -> Result<Vec<String>, NgSpiceError> {
+    fn all_vecs(&self, plot: &str) -> Result<Vec<String>, NgSpiceError> {
         let cs_res = CString::new(plot);
         if let Ok(cs) = cs_res {
             let raw = cs.into_raw();
@@ -203,7 +224,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    pub fn vector_info(&self, vec: &str) -> Result<VectorInfo, NgSpiceError> {
+    fn vector_info(&self, vec: &str) -> Result<VectorInfo, NgSpiceError> {
         let cs = CString::new(vec)?;
         let raw = cs.into_raw();
         unsafe {
@@ -212,19 +233,43 @@ impl<C: Callbacks> NgSpice<C> {
             let ptr = CStr::from_ptr(vecinfo.v_name).to_str()?;
             let len = vecinfo.v_length.try_into()?;
             let s = String::from(ptr);
+            let typ: simulation_types = std::mem::transmute(vecinfo.v_type);
             if !vecinfo.v_realdata.is_null() {
                 let real_slice = std::slice::from_raw_parts_mut(vecinfo.v_realdata, len);
                 return Ok(VectorInfo {
                     name: s,
-                    data: Vec::from(real_slice),
+                    dtype: typ,
+                    data: ComplexSlice::Real(real_slice),
                 })
-            } else { // todo complex data
+            }else if !vecinfo.v_compdata.is_null() {
+                let comp_slice = std::slice::from_raw_parts_mut(vecinfo.v_compdata, len);
                 return Ok(VectorInfo {
                     name: s,
-                    data: Vec::new(),
+                    dtype: typ,
+                    data: ComplexSlice::Complex(comp_slice),
                 })
+            } else {
+                return Err(NgSpiceError::EncodingError)
             }
         }
+    }
+
+    pub fn op(&self) -> Result<SimulationResult<C>, NgSpiceError> {
+        self.command("op")?;
+        let plot = self.current_plot()?;
+        let vecs = self.all_vecs(&plot)?;
+        let mut results = HashMap::new();
+        for vec in vecs {
+            if let Ok(vecinfo) = self.vector_info(&format!("{}.{}", plot, vec)) {
+                results.insert(vec, vecinfo);
+            }
+        }
+        let sim = SimulationResult {
+            name: plot,
+            data: results,
+            sim: self,
+        };
+        Ok(sim)
     }
 }
 
@@ -268,22 +313,21 @@ mod tests {
                 ".end",
             ])
             .expect("circuit failed");
-        spice.command("op").expect("op failed");
-        spice.command("alter m1 W=20u").expect("op failed");
-        spice.command("op").expect("op failed");
+        {
+            let sim1 = spice.op().expect("op failed");
+            println!("{}: {:?}", sim1.name, sim1.data);
+            spice.command("alter m1 W=20u").expect("op failed");
+            let sim2 = spice.op().expect("op failed");
+            println!("{}: {:?}", sim2.name, sim2.data);
+            let plots = spice.all_plots().expect("plots failed");
+            println!("{:?}", plots);
+            assert_eq!(plots[0], "op2");
+            let curplot = spice.current_plot().expect("curplot failed");
+            assert_eq!(curplot, "op2");
+        }
         let plots = spice.all_plots().expect("plots failed");
         println!("{:?}", plots);
-        assert_eq!(plots[0], "op2");
-        let curplot = spice.current_plot().expect("curplot failed");
-        assert_eq!(curplot, "op2");
-        for plot in plots {
-            let vecs = spice.all_vecs(&plot).expect("vecs");
-            println!("{}: {:?}", plot, vecs);
-            for vec in vecs {
-                let vecinfo = spice.vector_info(&format!("{}.{}", plot, vec));
-                println!("{:?}", vecinfo);
-            }
-        }
+        assert_eq!(plots.len(), 1);
         //spice.command("quit").expect("quit failed");
         //let result = std::panic::catch_unwind(|| spice.command("echo hello"));
         //assert!(result.is_err());
