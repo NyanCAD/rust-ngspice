@@ -1,9 +1,12 @@
+#![warn(elided_lifetimes_in_paths)]
+
 use ngspice_sys::*;
 use std::ffi::{CStr, CString, NulError};
 use std::os::raw::{c_char, c_int, c_void};
 use libloading::library_filename;
 use std::convert::TryInto;
 use std::collections::HashMap;
+
 
 #[derive(Debug)]
 pub enum NgSpiceError {
@@ -35,7 +38,7 @@ pub struct VectorInfo<'a> {
 pub struct SimulationResult<'a, C: Callbacks> {
     pub name: String,
     pub data: HashMap<String, VectorInfo<'a>>,
-    sim: &'a NgSpice<C>,
+    sim: std::sync::Arc<NgSpice<C>>,
 }
 
 impl <'a, C: Callbacks> Drop for SimulationResult<'a, C> {
@@ -119,7 +122,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    fn command(&self, s: &str) -> Result<(), NgSpiceError> {
+    pub fn command(&self, s: &str) -> Result<(), NgSpiceError> {
         if self.exited {
             panic!("NgSpice exited")
         }
@@ -224,7 +227,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    fn vector_info(&self, vec: &str) -> Result<VectorInfo, NgSpiceError> {
+    fn vector_info(&self, vec: &str) -> Result<VectorInfo<'_>, NgSpiceError> {
         let cs = CString::new(vec)?;
         let raw = cs.into_raw();
         unsafe {
@@ -253,8 +256,14 @@ impl<C: Callbacks> NgSpice<C> {
             }
         }
     }
+}
 
-    pub fn op(&self) -> Result<SimulationResult<C>, NgSpiceError> {
+pub trait Simulator<C: Callbacks> {
+    fn op(&self) -> Result<SimulationResult<'_, C>, NgSpiceError>;
+}
+
+impl<C: Callbacks> Simulator<C> for std::sync::Arc<NgSpice<C>> {
+    fn op(&self) -> Result<SimulationResult<'_, C>, NgSpiceError> {
         self.command("op")?;
         let plot = self.current_plot()?;
         let vecs = self.all_vecs(&plot)?;
@@ -267,7 +276,7 @@ impl<C: Callbacks> NgSpice<C> {
         let sim = SimulationResult {
             name: plot,
             data: results,
-            sim: self,
+            sim: self.to_owned(),
         };
         Ok(sim)
     }
