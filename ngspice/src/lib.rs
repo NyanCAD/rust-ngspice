@@ -227,7 +227,7 @@ impl<C: Callbacks> NgSpice<C> {
         }
     }
 
-    fn vector_info(&self, vec: &str) -> Result<VectorInfo<'_>, NgSpiceError> {
+    fn vector_info<'a>(&self, vec: &str) -> Result<VectorInfo<'a>, NgSpiceError> {
         let cs = CString::new(vec)?;
         let raw = cs.into_raw();
         unsafe {
@@ -259,11 +259,11 @@ impl<C: Callbacks> NgSpice<C> {
 }
 
 pub trait Simulator<C: Callbacks> {
-    fn op(&self) -> Result<SimulationResult<'_, C>, NgSpiceError>;
+    fn op<'a>(&self) -> Result<SimulationResult<'a, C>, NgSpiceError>;
 }
 
 impl<C: Callbacks> Simulator<C> for std::sync::Arc<NgSpice<C>> {
-    fn op(&self) -> Result<SimulationResult<'_, C>, NgSpiceError> {
+    fn op<'a>(&self) -> Result<SimulationResult<'a, C>, NgSpiceError> {
         self.command("op")?;
         let plot = self.current_plot()?;
         let vecs = self.all_vecs(&plot)?;
